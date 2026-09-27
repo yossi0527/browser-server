@@ -194,6 +194,16 @@ def healthz():
     return {"status": "ok", "memory": memory_report()}
 
 
+@app.get("/browsers")
+def browsers():
+    """אבחון התקנת Chromium - מה באמת קיים בדיסק."""
+    from cdp import browser_inventory
+    try:
+        return browser_inventory()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {str(e)[:300]}"}
+
+
 # הבדיקה רצה 2-3 דקות. בקשה סינכרונית כזו היא שגויה: השרת יכול להיפגע
 # באמצע, הלקוח ינתק, ואין דרך לשאול מה קרה. לכן הרצה ברקע + polling.
 _probe_state: Dict[str, Any] = {"status": "idle", "started_at": None, "result": None, "error": None}
