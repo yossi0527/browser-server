@@ -27,7 +27,9 @@ BROWSERS_PATH = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/ms-playwright")
 # ו-imagesEnabled=false חוסך טעינת תמונות שאנחנו לא צריכים לקרוא.
 LAUNCH_ARGS = [
     "--remote-debugging-port=0",
-    "--headless=new",
+    # לא מוסיפים --headless: ה-binary שאנחנו מפעילים הוא
+    # chromium-headless-shell, שכבר headless לפי הגדרה. מעבר --headless
+    # איתו גורם לתהליך לצאת מיד עם שגיאה.
     "--no-sandbox",
     "--disable-dev-shm-usage",
     "--disable-gpu",
