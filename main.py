@@ -1,47 +1,118 @@
 """
-שלב 0 - בדיקת אפשרות: האם Chromium נכנס ב-512MB של Render Free?
+Browser Server - שירת דפדפן נגיש לסוכן AI.
 
-השירות הזה אינו חלק מהמערכת. מטרתו להוכיח או להפיך את ההנחה
-שאפשר להריץ דפדפן בתוכנית החינמית, לפני שמשקיעים ימים בכתיבת הסוכן.
+מדדיד ומאמת: השירת הזו רצה בתוך 512MB של Render Free. Chromium במצב
+headless, ללא Playwright, דרך Chrome DevTools Protocol ישיר.
 
-הוא מפעיל Chromium ישירות דרך CDP (בלי Playwright, שאכל 108MB),
-טוען דפים בכבדות עולה, ומדווח כמה זיכרון נאכל בפועל.
+עקרונות שנבעו ממדידה (לא מניחות):
+  1. דפדפן אחד בלבד, ללא מקביליות - כל דפדפן נוסף הוא ~150MB
+  2. דף חדש לכל ניווט - שימוש באותו טאב גורם לצבירת זיכרון
+  3. הפעלה מחדש של הדפדפן כל N פעולות - Chromium מצטבר בתהליך עצמו
+  4. סגירה אחרי שקט - כדי לא להפקיד ~190MB שלא לצורך
+  5. שיא הזיכרון המדוד הוא PSS, לא RSS - רק כך סופרים זיכרון משותף נכון
 
-⚠️ תיקון חשוב: verdict מחושב לפי שיא הזיכרון *ואם הדפדפן שרד*.
-בגרסה הקודמת המדד נלקח אחרי שהדפדפן כבר נפל, ולכן דיווח "נכנס בנוחות"
-גם כשהתקלה הייתה OOM. הפעם זה לא יקרה שוב.
+אבטחה:
+  - BROWSER_TOKEN חובה. ללא היא כל הנתיבים סגורים.
+  - חסימת SSRF כדי שהשירות לא תהפוך לפרוקסי פתוח
+  - הגבלת קצב לפי IP
+  - אפשר להגביל לדומיין מורשים בלבד (ALLOWED_DOMAINS)
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import gc
+import hmac
 import os
 import time
+from collections import defaultdict, deque
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
 
-from cdp import CDP, BrowserError, find_browser
+from cdp import CDP, BrowserError, browser_inventory, check_url, resolve_browser
 
-app = FastAPI(title="chromium-fit-probe", version="2.0")
-
-MEMORY_LIMIT_MB = 512
-# Playwright אכל 108MB מתוך 512. ב-CDP הוא לא קיים, ולכן התקציב גדול יותר.
-PYTHON_OVERHEAD_MB = 90
-
-TEST_PAGES = [
-    ("example", "https://example.com", "דף מינימלי - רצפה"),
-    ("wikipedia-he", "https://he.wikipedia.org/wiki/ישראל", "תוכן אמיתי, JS, תמונות - המבחן"),
-    ("duckduckgo", "https://duckduckgo.com/?q=test", "אתר חיפוש דינמי"),
-]
+# =============================================================== הגדרות
+def _env(name: str, default: str = "") -> str:
+    return os.getenv(name, "").strip() or default
 
 
-def _read_rss_kb(pid: int) -> int:
+def _int(name: str, default: int) -> int:
     try:
-        with open(f"/proc/{pid}/status", "r") as fh:
+        return int(_env(name, str(default)) or default)
+    except ValueError:
+        return default
+
+
+TOKEN = _env("BROWSER_TOKEN")
+MEMORY_LIMIT_MB = _int("MEMORY_LIMIT_MB", 512)
+IDLE_TIMEOUT_SEC = _int("IDLE_TIMEOUT_SEC", 75)      # אחרי זה הדפדפן נסגר
+MAX_ACTIONS_PER_BROWSER = _int("MAX_ACTIONS_PER_BROWSER", 5)  # recycling
+MAX_TASKS_CONCURRENT = 1                            # 512MB = דפדפן אחד בלבד
+RATE_LIMIT_PER_MIN = _int("RATE_LIMIT_PER_MIN", 60)
+MAX_NAVIGATIONS_PER_SESSION = _int("MAX_NAVIGATIONS_PER_SESSION", 25)
+MAX_TEXT_CHARS = _int("MAX_TEXT_CHARS", 8000)
+ALLOWED_DOMAINS = [d.strip().lower() for d in _env("ALLOWED_DOMAINS").split(",") if d.strip()]
+
+app = FastAPI(title="browser-server", version="1.0")
+
+if not TOKEN:
+    print("WARNING: BROWSER_TOKEN is not set - the API will refuse every call.",
+          flush=True)
+
+
+# =============================================================== אבטחה
+_hits: Dict[str, deque] = defaultdict(deque)
+
+
+async def require_token(x_browser_token: str = Header(default="")) -> None:
+    """אימות. השירת אינה פעילה בלי טוקן - בכלל."""
+    if not TOKEN:
+        raise HTTPException(status_code=503, detail="BROWSER_TOKEN is not configured on the server")
+    provided = (x_browser_token or "").strip()
+    if not provided or not hmac.compare_digest(provided, TOKEN):
+        raise HTTPException(status_code=401, detail="missing or invalid X-Browser-Token")
+
+
+def require_rate_limit(request: Request) -> None:
+    if RATE_LIMIT_PER_MIN <= 0:
+        return
+    ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    q = _hits[ip]
+    while q and now - q[0] > 60:
+        q.popleft()
+    if len(q) >= RATE_LIMIT_PER_MIN:
+        raise HTTPException(status_code=429, detail="rate limit exceeded (per minute)")
+    q.append(now)
+    if len(_hits) > 2000:
+        for k in [k for k, v in _hits.items() if not v]:
+            _hits.pop(k, None)
+
+
+def guard_url(url: str) -> str:
+    """חסימת SSRF + אופציונלי רשימת דומיינים מורשים."""
+    clean = check_url(url)
+    if ALLOWED_DOMAINS:
+        host = (urlparse(clean).hostname or "").lower()
+        ok = any(host == d or host.endswith("." + d) for d in ALLOWED_DOMAINS)
+        if not ok:
+            raise HTTPException(
+                status_code=403,
+                detail=f"domain not allowed: {host} (allowed: {', '.join(ALLOWED_DOMAINS)})",
+            )
+    return clean
+
+
+# =========================================================== מדידת זיכרון
+def _pss_kb(pid: int) -> int:
+    try:
+        with open(f"/proc/{pid}/smaps_rollup", "r") as fh:
             for line in fh:
-                if line.startswith("VmRSS:"):
+                if line.startswith("Pss:"):
                     return int(line.split()[1])
     except Exception:
         pass
@@ -56,26 +127,8 @@ def _cmdline(pid: int) -> str:
         return ""
 
 
-def _read_pss_kb(pid: int) -> int:
-    """PSS - Proportional Set Size.
-
-    ⚠️ זה המדד הנכון, ולא RSS. כל תהליך ב-Chromium חולק ספריות ו-mappings
-    עם תהליבים אחרים. RSS סופר זיכרון משותף פעם לכל תהליך שנוגע בו,
-    ולכן סכום RSS של 3 תהליכים יכול להפיל פי 2-3 מהצריכה האמיתית.
-    מגבלת הזיכרון של הקונטיינר סופרת כל עמוד פעם אחת - בדיוק כמו PSS.
-    """
-    try:
-        with open(f"/proc/{pid}/smaps_rollup", "r") as fh:
-            for line in fh:
-                if line.startswith("Pss:"):
-                    return int(line.split()[1])
-    except Exception:
-        pass
-    return 0
-
-
 def memory_report() -> Dict[str, Any]:
-    chromium = pss = rss = node = python = 0
+    chromium = python = 0
     procs = 0
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -86,210 +139,421 @@ def memory_report() -> Dict[str, Any]:
             continue
         low = cmd.lower()
         if "chrome" in low or "chromium" in low or "headless_shell" in low:
-            chromium += 1
+            chromium += _pss_kb(pid)
             procs += 1
-            pss += _read_pss_kb(pid)
-            rss += _read_rss_kb(pid)
-        elif "playwright" in low and "node" in low:
-            node += _read_rss_kb(pid)
         elif "uvicorn" in low or "python" in low:
-            python += _read_pss_kb(pid) or _read_rss_kb(pid)
+            python += _pss_kb(pid)
     return {
-        # PSS = המדידה המכריעה
-        "total_pss_mb": round((pss + node + python) / 1024, 1),
-        "chromium_pss_mb": round(pss / 1024, 1),
-        "chromium_rss_mb": round(rss / 1024, 1),   # להשוואה
-        "node_driver_pss_mb": round(node / 1024, 1),
+        "total_pss_mb": round((chromium + python) / 1024, 1),
+        "chromium_pss_mb": round(chromium / 1024, 1),
         "python_pss_mb": round(python / 1024, 1),
         "chromium_processes": procs,
         "limit_mb": MEMORY_LIMIT_MB,
-        "budget_for_chromium_mb": MEMORY_LIMIT_MB - PYTHON_OVERHEAD_MB,
     }
 
 
-def _rss() -> float:
-    return memory_report()["total_rss_mb"]
+# =========================================================== מנהל הדפדפן
+class Session:
+    """דפדפן אחד + דף אחד. ממוחזר אוטומטית כדי לא לצבור זיכרון."""
 
+    def __init__(self, sid: str):
+        self.id = sid
+        self.cdp: Optional[CDP] = None
+        self.page = None
+        self.actions = 0
+        self.navigations = 0
+        self.last_used = time.time()
+        self.url = ""
+        self.title = ""
+        self.history: List[str] = []
+        self.lock = asyncio.Lock()
+        self.restarts = 0
 
-async def run_probe() -> Dict[str, Any]:
-    result: Dict[str, Any] = {"mode": "direct-cdp", "fresh_page_per_navigation": True, "steps": []}
-    peak_pss = 0.0
-    peak_rss = 0.0
-    cdp = CDP()
+    async def ensure(self) -> Any:
+        if self.page is not None:
+            self.touch()
+            return self.page
+        await self.launch()
+        return self.page
 
-    def note(step: str, **kw: Any) -> None:
-        nonlocal peak_pss, peak_rss
-        mem = memory_report()
-        peak_pss = max(peak_pss, mem["total_pss_mb"])
-        peak_rss = max(peak_rss, mem["chromium_rss_mb"])
-        entry = {"step": step, "memory": mem}
-        entry.update(kw)
-        result["steps"].append(entry)
+    async def launch(self) -> None:
+        await self.teardown()
+        self.cdp = CDP()
+        await self.cdp.start()
+        self.page = await self.cdp.new_page()
+        self.actions = 0
+        self.navigations = 0
+        self.history = []
+        self.url = ""
+        self.title = ""
+        self.restarts += 1
+        self.touch()
 
-    try:
-        result["binary"] = find_browser()
-    except BrowserError as e:
-        result["error"] = str(e)
-        result["verdict"] = {"fits": False, "headroom_mb": 0,
-                             "message": "לא נמצאה התקנת Chromium", "crashed": True}
-        return result
+    async def recycle(self) -> None:
+        """הפעלה מחדש. נקרא אחרי מספר פעולים כדי לא לצבור זיכרון."""
+        await self.launch()
 
-    try:
-        t0 = time.time()
-        page = await cdp.new_page()
-        result["launch_ms"] = int((time.time() - t0) * 1000)
-        note("chromium_launched")
-        try:
-            result["version"] = (await cdp.send("Browser.getVersion")).get("product", "")
-        except Exception:
-            result["version"] = "unknown"
-
-        for name, url, note_txt in TEST_PAGES:
-            step: Dict[str, Any] = {"name": name, "note": note_txt}
-            # דף נקי לכל ניווט: בדיקה קודמת הראתה שהזיכרון גדל באופן
-            # מונוטוני (429 -> 468 -> 592MB) כשמשתמשים באותו טאב.
+    async def teardown(self) -> None:
+        if self.cdp:
             try:
-                await page.close()
+                await self.cdp.stop()
             except Exception:
                 pass
-            try:
-                page = await cdp.new_page()
-            except Exception as e2:
-                step["ok"] = False
-                step["error"] = f"new_page failed: {str(e2)[:150]}"
-                note("load", **step)
-                break
-
-            try:
-                t0 = time.time()
-                res = await page.goto(url, timeout=15.0)
-                step["load_ms"] = int((time.time() - t0) * 1000)
-                step["url"] = res.get("url")
-                step["title"] = (res.get("title") or "")[:120]
-                page_info = await page.read_page(max_chars=4000)
-                step["text_chars"] = len(page_info["text"])
-                step["ok"] = True
-            except Exception as e:
-                step["ok"] = False
-                step["error"] = f"{type(e).__name__}: {str(e)[:200]}"
-            note("load", **step)
-
-        try:
-            await cdp.stop()
-        except Exception:
-            pass
+        self.cdp = None
+        self.page = None
         gc.collect()
-        note("after_shutdown")
-    except Exception as e:
-        result["error"] = f"{type(e).__name__}: {str(e)[:300]}"
-        try:
-            await cdp.stop()
-        except Exception:
-            pass
 
-    # ---- פסק חסין, לפי PSS (המדד שמתאים למגבלת הקונטיינר) ----
-    loaded = [s for s in result["steps"] if s.get("step") == "load"]
-    successes = [s for s in loaded if s.get("ok")]
-    crashed = not bool(successes) or bool(result.get("error"))
+    def touch(self) -> None:
+        self.last_used = time.time()
 
-    headroom = MEMORY_LIMIT_MB - peak_pss
-    if not successes:
-        verdict = {"fits": False, "headroom_mb": round(headroom, 1),
-                   "message": "הדפדפן לא העלה אף דף - נפל", "crashed": True}
-    elif len(successes) < len(TEST_PAGES):
-        failed = [s["name"] for s in loaded if not s.get("ok")]
-        verdict = {"fits": False, "headroom_mb": round(headroom, 1),
-                   "message": f"נכשל ב: {', '.join(failed)}", "crashed": True}
-    elif headroom > 100:
-        verdict = {"fits": True, "headroom_mb": round(headroom, 1),
-                   "message": "עבר בהצלחה את כל הדפים, עם מרווח מספיק", "crashed": False}
-    elif headroom > 30:
-        verdict = {"fits": True, "headroom_mb": round(headroom, 1),
-                   "message": "עבר את כל הדפים במצוקה - דפדפן אחד, סגירה מיידית", "crashed": False}
-    else:
-        verdict = {"fits": False, "headroom_mb": round(headroom, 1),
-                   "message": "המרווח קטן מדי גם לפי PSS", "crashed": False}
+    def idle_for(self) -> float:
+        return time.time() - self.last_used
 
-    result["peak_pss_mb"] = round(peak_pss, 1)
-    result["peak_chromium_rss_mb"] = round(peak_rss, 1)
-    result["metric"] = "PSS (smaps_rollup) - accounts shared memory correctly"
-    result["pages_loaded"] = f"{len(successes)}/{len(TEST_PAGES)}"
-    result["verdict"] = verdict
-    return result
+    def should_recycle(self) -> bool:
+        return self.actions >= MAX_ACTIONS_PER_BROWSER
+
+    def state(self) -> Dict[str, Any]:
+        return {
+            "session": self.id,
+            "alive": self.page is not None,
+            "actions": self.actions,
+            "navigations": self.navigations,
+            "restarts": self.restarts,
+            "idle_sec": round(self.idle_for(), 1),
+            "url": self.url,
+            "title": self.title,
+            "memory": memory_report(),
+        }
+
+
+class BrowserManager:
+    def __init__(self) -> None:
+        self.sessions: Dict[str, Session] = {}
+        self.gate = asyncio.Semaphore(MAX_TASKS_CONCURRENT)
+        self._sweeper: Optional[asyncio.Task] = None
+
+    def start(self) -> None:
+        if self._sweeper is None:
+            self._sweeper = asyncio.create_task(self._sweep())
+
+    def get(self, sid: str) -> Session:
+        s = self.sessions.get(sid)
+        if s is None:
+            s = Session(sid)
+            self.sessions[sid] = s
+        return s
+
+    async def _sweep(self) -> None:
+        """סוגר דפדפנים שלא בשימוש - כל דפדפן שקט מנערך ~190MB."""
+        while True:
+            try:
+                await asyncio.sleep(10)
+                for sid in list(self.sessions):
+                    s = self.sessions[sid]
+                    if s.page is not None and s.idle_for() > IDLE_TIMEOUT_SEC:
+                        await s.teardown()
+                    if s.page is None and s.idle_for() > IDLE_TIMEOUT_SEC * 4:
+                        self.sessions.pop(sid, None)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                pass
+
+    async def shutdown(self) -> None:
+        if self._sweeper:
+            self._sweeper.cancel()
+        for s in list(self.sessions.values()):
+            await s.teardown()
+
+
+manager = BrowserManager()
+
+
+# =============================================================== מודלים
+class OpenReq(BaseModel):
+    url: str = Field(..., max_length=2000)
+
+
+class SelectorReq(BaseModel):
+    selector: str = Field(..., max_length=500)
+
+
+class FillReq(BaseModel):
+    selector: str = Field(..., max_length=500)
+    text: str = Field(default="", max_length=8000)
+
+
+class PressReq(BaseModel):
+    key: str = Field(default="enter", max_length=20)
+
+
+class ScrollReq(BaseModel):
+    direction: str = Field(default="down", max_length=10)
+    amount: Optional[int] = None
+
+
+class ReadReq(BaseModel):
+    maxChars: int = Field(default=MAX_TEXT_CHARS, le=20000)
+
+
+class ShotReq(BaseModel):
+    fullPage: bool = False
+
+
+# ================================================================== נתיבים
+@app.on_event("startup")
+async def _startup() -> None:
+    manager.start()
+    try:
+        path, needs_headless = resolve_browser()
+        print(f"[boot] chromium={path} needs_headless_flag={needs_headless}", flush=True)
+    except BrowserError as e:
+        print(f"[boot] no chromium: {e}", flush=True)
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    await manager.shutdown()
 
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok", "memory": memory_report()}
+    return {
+        "status": "ok",
+        "auth_configured": bool(TOKEN),
+        "sessions": len(manager.sessions),
+        "memory": memory_report(),
+        "limits": {
+            "idle_timeout_sec": IDLE_TIMEOUT_SEC,
+            "actions_per_browser": MAX_ACTIONS_PER_BROWSER,
+            "max_concurrent": MAX_TASKS_CONCURRENT,
+            "rate_limit_per_min": RATE_LIMIT_PER_MIN,
+        },
+    }
 
 
-@app.get("/browsers")
+@app.get("/browsers", dependencies=[Depends(require_token)])
 def browsers():
-    """אבחון התקנת Chromium - מה באמת קיים בדיסק."""
-    from cdp import browser_inventory
     try:
         return browser_inventory()
     except Exception as e:
         return {"error": f"{type(e).__name__}: {str(e)[:300]}"}
 
 
-# הבדיקה רצה 2-3 דקות. בקשה סינכרונית כזו היא שגויה: השרת יכול להיפגע
-# באמצע, הלקוח ינתק, ואין דרך לשאול מה קרה. לכן הרצה ברקע + polling.
-_probe_state: Dict[str, Any] = {"status": "idle", "started_at": None, "result": None, "error": None}
-_probe_lock = asyncio.Lock()
+@app.get("/b/state", dependencies=[Depends(require_token)])
+def state(session: str = "default"):
+    return manager.get(session).state()
 
 
-@app.get("/probe", response_class=JSONResponse)
-async def probe_status():
-    return JSONResponse(content=dict(_probe_state))
+@app.delete("/b/session", dependencies=[Depends(require_token)])
+async def close_session(session: str = "default"):
+    s = manager.sessions.get(session)
+    if s:
+        await s.teardown()
+        return {"closed": True, "memory": memory_report()}
+    return {"closed": False, "note": "no such session"}
 
 
-@app.post("/probe", response_class=JSONResponse)
-async def probe_start():
-    async with _probe_lock:
-        if _probe_state["status"] == "running":
-            return JSONResponse(content={"status": "running", "note": "כבר רץ"})
-
-        _probe_state.update({"status": "running", "started_at": time.time(),
-                             "result": None, "error": None})
-
-        async def _job() -> None:
+@app.post("/b/open", dependencies=[Depends(require_token), Depends(require_rate_limit)])
+async def b_open(req: OpenReq, session: str = "default"):
+    guard_url(req.url)
+    async with manager.gate:
+        s = manager.get(session)
+        async with s.lock:
             try:
-                _probe_state["result"] = await run_probe()
-                _probe_state["status"] = "done"
+                if s.page is None or s.should_recycle():
+                    await s.launch()
+                if s.navigations >= MAX_NAVIGATIONS_PER_SESSION:
+                    await s.recycle()
+                res = await s.page.goto(guard_url(req.url), timeout=20.0)
+                s.url = res["url"]
+                s.title = res["title"]
+                s.history.append(s.url)
+                s.navigations += 1
+                s.actions += 1
+                s.touch()
+                return {"url": s.url, "title": s.title,
+                        "navigations": s.navigations, "memory": memory_report()}
+            except HTTPException:
+                raise
             except Exception as e:
-                _probe_state["error"] = f"{type(e).__name__}: {str(e)[:300]}"
-                _probe_state["status"] = "failed"
-            finally:
-                gc.collect()
-
-        asyncio.create_task(_job())
-        return JSONResponse(content={"status": "running", "note": "הבדיקה החלה"})
+                await s.teardown()
+                raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:250]}")
 
 
-@app.get("/probe/result", response_class=JSONResponse)
-async def probe_result():
-    """תוצאה מלאה בלבד, או null אם עדיין רצה."""
-    if _probe_state["status"] == "done":
-        return JSONResponse(content=_probe_state["result"])
-    return JSONResponse(content={
-        "status": _probe_state["status"],
-        "error": _probe_state["error"],
-        "memory": memory_report(),
-    })
+@app.post("/b/read", dependencies=[Depends(require_token), Depends(require_rate_limit)])
+async def b_read(req: ReadReq, session: str = "default"):
+    async with manager.gate:
+        s = manager.get(session)
+        async with s.lock:
+            if s.page is None:
+                raise HTTPException(status_code=409, detail="no page open - call /b/open first")
+            try:
+                info = await s.page.read_page(max_chars=req.maxChars)
+                s.actions += 1
+                s.touch()
+                return {**info, "url": s.url or info.get("url"), "memory": memory_report()}
+            except Exception as e:
+                await s.teardown()
+                raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:250]}")
+
+
+@app.post("/b/links", dependencies=[Depends(require_token), Depends(require_rate_limit)])
+async def b_links(req: ReadReq, session: str = "default"):
+    limit = max(1, min(req.maxChars // 120, 120))
+    async with manager.gate:
+        s = manager.get(session)
+        async with s.lock:
+            if s.page is None:
+                raise HTTPException(status_code=409, detail="no page open")
+            try:
+                links = await s.page.get_links(limit=limit)
+                s.actions += 1
+                s.touch()
+                return {"url": s.url, "count": len(links), "links": links}
+            except Exception as e:
+                await s.teardown()
+                raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:250]}")
+
+
+@app.post("/b/click", dependencies=[Depends(require_token), Depends(require_rate_limit)])
+async def b_click(req: SelectorReq, session: str = "default"):
+    async with manager.gate:
+        s = manager.get(session)
+        async with s.lock:
+            if s.page is None:
+                raise HTTPException(status_code=409, detail="no page open")
+            try:
+                res = await s.page.click(req.selector, timeout=10.0)
+                s.actions += 1
+                s.touch()
+                try:
+                    s.url = await s.page.current_url()
+                    s.title = await s.page.title_now()
+                except Exception:
+                    pass
+                return {**res, "url": s.url, "title": s.title, "memory": memory_report()}
+            except BrowserError as e:
+                raise HTTPException(status_code=404, detail=str(e)[:250])
+            except Exception as e:
+                await s.teardown()
+                raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:250]}")
+
+
+@app.post("/b/fill", dependencies=[Depends(require_token), Depends(require_rate_limit)])
+async def b_fill(req: FillReq, session: str = "default"):
+    async with manager.gate:
+        s = manager.get(session)
+        async with s.lock:
+            if s.page is None:
+                raise HTTPException(status_code=409, detail="no page open")
+            try:
+                res = await s.page.fill(req.selector, req.text)
+                s.actions += 1
+                s.touch()
+                return res
+            except BrowserError as e:
+                raise HTTPException(status_code=404, detail=str(e)[:250])
+            except Exception as e:
+                await s.teardown()
+                raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:250]}")
+
+
+@app.post("/b/press", dependencies=[Depends(require_token), Depends(require_rate_limit)])
+async def b_press(req: PressReq, session: str = "default"):
+    async with manager.gate:
+        s = manager.get(session)
+        async with s.lock:
+            if s.page is None:
+                raise HTTPException(status_code=409, detail="no page open")
+            try:
+                res = await s.page.press(req.key)
+                s.actions += 1
+                s.touch()
+                try:
+                    s.url = await s.page.current_url()
+                except Exception:
+                    pass
+                return {**res, "url": s.url}
+            except BrowserError as e:
+                raise HTTPException(status_code=400, detail=str(e)[:250])
+            except Exception as e:
+                await s.teardown()
+                raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:250]}")
+
+
+@app.post("/b/scroll", dependencies=[Depends(require_token), Depends(require_rate_limit)])
+async def b_scroll(req: ScrollReq, session: str = "default"):
+    async with manager.gate:
+        s = manager.get(session)
+        async with s.lock:
+            if s.page is None:
+                raise HTTPException(status_code=409, detail="no page open")
+            try:
+                res = await s.page.scroll(req.direction, req.amount)
+                s.actions += 1
+                s.touch()
+                return res
+            except Exception as e:
+                await s.teardown()
+                raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:250]}")
+
+
+@app.post("/b/back", dependencies=[Depends(require_token), Depends(require_rate_limit)])
+async def b_back(session: str = "default"):
+    async with manager.gate:
+        s = manager.get(session)
+        async with s.lock:
+            if s.page is None:
+                raise HTTPException(status_code=409, detail="no page open")
+            try:
+                res = await s.page.go_back()
+                s.url = res.get("url", s.url)
+                s.title = res.get("title", s.title)
+                s.actions += 1
+                s.touch()
+                return {"url": s.url, "title": s.title}
+            except Exception as e:
+                await s.teardown()
+                raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:250]}")
+
+
+@app.post("/b/screenshot", dependencies=[Depends(require_token), Depends(require_rate_limit)])
+async def b_shot(req: ShotReq, session: str = "default"):
+    async with manager.gate:
+        s = manager.get(session)
+        async with s.lock:
+            if s.page is None:
+                raise HTTPException(status_code=409, detail="no page open")
+            try:
+                png_b64 = await s.page.screenshot(full_page=req.fullPage)
+                raw = base64.b64decode(png_b64)
+                s.actions += 1
+                s.touch()
+                capped = len(raw) > 900_000
+                return {
+                    "mime": "image/png",
+                    "bytes": len(raw),
+                    "truncated": capped,
+                    "data_base64": png_b64 if not capped else png_b64[:1_200_000],
+                }
+            except Exception as e:
+                await s.teardown()
+                raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:250]}")
 
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    mem = memory_report()
-    return HTMLResponse(f"""<!DOCTYPE html>
-<html lang="he" dir="rtl"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>בדיקת Chromium</title>
-<style>body{{font-family:system-ui;background:#0f172a;color:#e2e8f0;padding:26px;direction:rtl}}
-h1{{font-size:21px}}pre{{background:#1e293b;padding:12px;border-radius:8px;overflow:auto;font-size:13px}}
-a{{color:#38bdf8}}</style></head><body>
-<h1>בדיקת Chromium ב-Render Free (512MB)</h1>
-<pre>{mem}</pre>
-<p><a href="/probe">הרץ בדיקה מלאה</a> (3 דפים, כ-30 שניות)</p>
+    return HTMLResponse(f"""<!DOCTYPE html><html lang="he" dir="rtl">
+<head><meta charset="utf-8"><title>browser-server</title>
+<style>body{{font-family:system-ui;background:#0f172a;color:#e2e8f0;padding:28px;direction:rtl}}
+code{{background:#1e293b;padding:2px 6px;border-radius:4px}}</style></head><body>
+<h1>browser-server</h1>
+<p>שירת דפדפן headless לסוכן AI. רצה בתוך 512MB.</p>
+<pre>{memory_report()}</pre>
+<p>נתיבים: <code>POST /b/open</code> <code>/b/read</code> <code>/b/links</code>
+<code>/b/click</code> <code>/b/fill</code> <code>/b/press</code>
+<code>/b/scroll</code> <code>/b/back</code> <code>/b/screenshot</code></p>
+<p>כל הנתיבים דורשים כותרת <code>X-Browser-Token</code>.</p>
+<p><code>GET /healthz</code> · <code>GET /b/state</code></p>
 </body></html>""")
