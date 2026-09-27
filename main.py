@@ -56,10 +56,26 @@ def _cmdline(pid: int) -> str:
         return ""
 
 
+def _read_pss_kb(pid: int) -> int:
+    """PSS - Proportional Set Size.
+
+    ⚠️ זה המדד הנכון, ולא RSS. כל תהליך ב-Chromium חולק ספריות ו-mappings
+    עם תהליבים אחרים. RSS סופר זיכרון משותף פעם לכל תהליך שנוגע בו,
+    ולכן סכום RSS של 3 תהליכים יכול להפיל פי 2-3 מהצריכה האמיתית.
+    מגבלת הזיכרון של הקונטיינר סופרת כל עמוד פעם אחת - בדיוק כמו PSS.
+    """
+    try:
+        with open(f"/proc/{pid}/smaps_rollup", "r") as fh:
+            for line in fh:
+                if line.startswith("Pss:"):
+                    return int(line.split()[1])
+    except Exception:
+        pass
+    return 0
+
+
 def memory_report() -> Dict[str, Any]:
-    chromium = 0
-    node = 0
-    python = 0
+    chromium = pss = rss = node = python = 0
     procs = 0
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -70,17 +86,21 @@ def memory_report() -> Dict[str, Any]:
             continue
         low = cmd.lower()
         if "chrome" in low or "chromium" in low or "headless_shell" in low:
-            chromium += _read_rss_kb(pid)
+            chromium += 1
             procs += 1
+            pss += _read_pss_kb(pid)
+            rss += _read_rss_kb(pid)
         elif "playwright" in low and "node" in low:
             node += _read_rss_kb(pid)
         elif "uvicorn" in low or "python" in low:
-            python += _read_rss_kb(pid)
+            python += _read_pss_kb(pid) or _read_rss_kb(pid)
     return {
-        "chromium_rss_mb": round(chromium / 1024, 1),
-        "node_driver_rss_mb": round(node / 1024, 1),
-        "python_rss_mb": round(python / 1024, 1),
-        "total_rss_mb": round((chromium + node + python) / 1024, 1),
+        # PSS = המדידה המכריעה
+        "total_pss_mb": round((pss + node + python) / 1024, 1),
+        "chromium_pss_mb": round(pss / 1024, 1),
+        "chromium_rss_mb": round(rss / 1024, 1),   # להשוואה
+        "node_driver_pss_mb": round(node / 1024, 1),
+        "python_pss_mb": round(python / 1024, 1),
         "chromium_processes": procs,
         "limit_mb": MEMORY_LIMIT_MB,
         "budget_for_chromium_mb": MEMORY_LIMIT_MB - PYTHON_OVERHEAD_MB,
@@ -92,14 +112,16 @@ def _rss() -> float:
 
 
 async def run_probe() -> Dict[str, Any]:
-    result: Dict[str, Any] = {"mode": "direct-cdp", "steps": []}
-    peak = 0.0
+    result: Dict[str, Any] = {"mode": "direct-cdp", "fresh_page_per_navigation": True, "steps": []}
+    peak_pss = 0.0
+    peak_rss = 0.0
     cdp = CDP()
 
     def note(step: str, **kw: Any) -> None:
-        nonlocal peak
+        nonlocal peak_pss, peak_rss
         mem = memory_report()
-        peak = max(peak, mem["total_rss_mb"])
+        peak_pss = max(peak_pss, mem["total_pss_mb"])
+        peak_rss = max(peak_rss, mem["chromium_rss_mb"])
         entry = {"step": step, "memory": mem}
         entry.update(kw)
         result["steps"].append(entry)
@@ -124,9 +146,23 @@ async def run_probe() -> Dict[str, Any]:
 
         for name, url, note_txt in TEST_PAGES:
             step: Dict[str, Any] = {"name": name, "note": note_txt}
+            # דף נקי לכל ניווט: בדיקה קודמת הראתה שהזיכרון גדל באופן
+            # מונוטוני (429 -> 468 -> 592MB) כשמשתמשים באותו טאב.
+            try:
+                await page.close()
+            except Exception:
+                pass
+            try:
+                page = await cdp.new_page()
+            except Exception as e2:
+                step["ok"] = False
+                step["error"] = f"new_page failed: {str(e2)[:150]}"
+                note("load", **step)
+                break
+
             try:
                 t0 = time.time()
-                res = await page.goto(url, timeout=30.0)
+                res = await page.goto(url, timeout=15.0)
                 step["load_ms"] = int((time.time() - t0) * 1000)
                 step["url"] = res.get("url")
                 step["title"] = (res.get("title") or "")[:120]
@@ -137,16 +173,11 @@ async def run_probe() -> Dict[str, Any]:
                 step["ok"] = False
                 step["error"] = f"{type(e).__name__}: {str(e)[:200]}"
             note("load", **step)
-            if not step.get("ok"):
-                # הדפדפן נפל או שהדף נכשל - ממשיך לנסות את הבא
-                try:
-                    page = await cdp.new_page()
-                    note("new_page_after_failure")
-                except Exception as e2:
-                    step["recovery"] = f"could not recover: {str(e2)[:120]}"
-                    break
 
-        await cdp.stop()
+        try:
+            await cdp.stop()
+        except Exception:
+            pass
         gc.collect()
         note("after_shutdown")
     except Exception as e:
@@ -156,34 +187,32 @@ async def run_probe() -> Dict[str, Any]:
         except Exception:
             pass
 
-    # ---- פסק חסין: מתחשב לפי שיא + האם דפים באמת נטענו ----
+    # ---- פסק חסין, לפי PSS (המדד שמתאים למגבלת הקונטיינר) ----
     loaded = [s for s in result["steps"] if s.get("step") == "load"]
     successes = [s for s in loaded if s.get("ok")]
     crashed = not bool(successes) or bool(result.get("error"))
 
-    headroom = MEMORY_LIMIT_MB - peak
+    headroom = MEMORY_LIMIT_MB - peak_pss
     if not successes:
         verdict = {"fits": False, "headroom_mb": round(headroom, 1),
                    "message": "הדפדפן לא העלה אף דף - נפל", "crashed": True}
     elif len(successes) < len(TEST_PAGES):
         failed = [s["name"] for s in loaded if not s.get("ok")]
-        verdict = {
-            "fits": False,
-            "headroom_mb": round(headroom, 1),
-            "message": f"נכשל ב: {', '.join(failed)} - הזיכרון אינו מספיק לכל הדפים",
-            "crashed": True,
-        }
+        verdict = {"fits": False, "headroom_mb": round(headroom, 1),
+                   "message": f"נכשל ב: {', '.join(failed)}", "crashed": True}
     elif headroom > 100:
         verdict = {"fits": True, "headroom_mb": round(headroom, 1),
                    "message": "עבר בהצלחה את כל הדפים, עם מרווח מספיק", "crashed": False}
     elif headroom > 30:
         verdict = {"fits": True, "headroom_mb": round(headroom, 1),
-                   "message": "עבר את כל הדפים אך במצוקה - דפדפן אחד בלבד וסגירה מהירה", "crashed": False}
+                   "message": "עבר את כל הדפים במצוקה - דפדפן אחד, סגירה מיידית", "crashed": False}
     else:
         verdict = {"fits": False, "headroom_mb": round(headroom, 1),
-                   "message": "המרווח קטן מדי - כל עוד דף כבד יפיל אותו", "crashed": False}
+                   "message": "המרווח קטן מדי גם לפי PSS", "crashed": False}
 
-    result["peak_rss_mb"] = round(peak, 1)
+    result["peak_pss_mb"] = round(peak_pss, 1)
+    result["peak_chromium_rss_mb"] = round(peak_rss, 1)
+    result["metric"] = "PSS (smaps_rollup) - accounts shared memory correctly"
     result["pages_loaded"] = f"{len(successes)}/{len(TEST_PAGES)}"
     result["verdict"] = verdict
     return result
