@@ -78,6 +78,29 @@ def _first_exec(paths: List[str]) -> Optional[str]:
     return None
 
 
+# קבצים שאינם הדפדפן עצמו - נמצאים בתיקיית ההתקנה אך אינם binary
+_NOT_BROWSER_SUFFIX = (".so", ".pak", ".json", ".bin", ".dat", ".png", ".txt",
+                       ".png", ".html", ".js", ".md", ".xml", ".ttf", ".py")
+
+
+def _walk_for_executable(root: str) -> List[str]:
+    """סורק תיקייה ומחזיר קבצים הרצה.
+
+    השם הפנימי של headless_shell משתנה בין גרסאות של Playwright
+    (chrome-linux/headless_shell, chrome-headless-shell-linux64/...), ולכן
+    במקום לנחש תבניות - סופרים את התיקייה בפועל.
+    """
+    found: List[str] = []
+    for base, _dirs, files in os.walk(root):
+        for name in files:
+            if name.endswith(_NOT_BROWSER_SUFFIX):
+                continue
+            path = os.path.join(base, name)
+            if os.path.isfile(path) and os.access(path, os.X_OK) and os.path.getsize(path) > 2_000_000:
+                found.append(path)
+    return sorted(found)
+
+
 def find_browser() -> str:
     """מאתר Chromium. מעדיף headless_shell - קל יותר בזיכרון."""
     return resolve_browser()[0]
@@ -96,20 +119,30 @@ def _collect(globs: tuple) -> List[str]:
 
 
 def resolve_browser() -> tuple:
-    """מחזיר (נתיב, צריך_headless_flag)."""
-    shell = _first_exec(_collect(_SHELL_GLOBS))
-    if shell:
-        return shell, False
-    full = _first_exec(_collect(_FULL_GLOBS))
-    if full:
-        return full, True
+    """מחזיר (נתיב, צריך_headless_flag).
+
+    שלב 1: headless_shell — קל יותר ונכנס פחות זיכרון.
+    שלב 2: chrome המלא (דורש את דגל --headless).
+    """
+    shell_dirs = sorted(glob.glob(os.path.join(BROWSERS_PATH, "chromium_headless_shell-*")))
+    for root in shell_dirs:
+        hits = _walk_for_executable(root)
+        if hits:
+            return hits[0], False
+
+    full_dirs = sorted(glob.glob(os.path.join(BROWSERS_PATH, "chromium-*")))
+    for root in full_dirs:
+        hits = _walk_for_executable(root)
+        if hits:
+            return hits[0], True
+
     for name in ("chromium", "chromium-browser", "google-chrome", "chrome"):
         found = shutil.which(name)
         if found:
             return found, True
     raise BrowserError(
         f"No Chromium binary found under {BROWSERS_PATH}. "
-        f"Shell globs: {list(_SHELL_GLOBS)} Full globs: {list(_FULL_GLOBS)}"
+        f"dirs={sorted(os.listdir(BROWSERS_PATH)) if os.path.isdir(BROWSERS_PATH) else 'missing'}"
     )
 
 
@@ -129,6 +162,12 @@ def browser_inventory() -> dict:
     for p in _FULL_GLOBS:
         for hit in _collect((p,)):
             inv["full_candidates"].append({"path": hit, "exec": os.access(hit, os.X_OK)})
+    for root in sorted(glob.glob(os.path.join(BROWSERS_PATH, "*"))):
+        if os.path.isdir(root):
+            hits = _walk_for_executable(root)
+            if hits:
+                inv.setdefault("walked", []).append(
+                    {"dir": os.path.basename(root), "executables": hits[:4]})
     try:
         inv["resolved"] = {"path": find_browser(), "needs_headless_flag": resolve_browser()[1]}
     except BrowserError as e:
