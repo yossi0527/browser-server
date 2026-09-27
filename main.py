@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import gc
 import os
 import time
@@ -193,9 +194,50 @@ def healthz():
     return {"status": "ok", "memory": memory_report()}
 
 
+# הבדיקה רצה 2-3 דקות. בקשה סינכרונית כזו היא שגויה: השרת יכול להיפגע
+# באמצע, הלקוח ינתק, ואין דרך לשאול מה קרה. לכן הרצה ברקע + polling.
+_probe_state: Dict[str, Any] = {"status": "idle", "started_at": None, "result": None, "error": None}
+_probe_lock = asyncio.Lock()
+
+
 @app.get("/probe", response_class=JSONResponse)
-async def probe():
-    return JSONResponse(content=await run_probe())
+async def probe_status():
+    return JSONResponse(content=dict(_probe_state))
+
+
+@app.post("/probe", response_class=JSONResponse)
+async def probe_start():
+    async with _probe_lock:
+        if _probe_state["status"] == "running":
+            return JSONResponse(content={"status": "running", "note": "כבר רץ"})
+
+        _probe_state.update({"status": "running", "started_at": time.time(),
+                             "result": None, "error": None})
+
+        async def _job() -> None:
+            try:
+                _probe_state["result"] = await run_probe()
+                _probe_state["status"] = "done"
+            except Exception as e:
+                _probe_state["error"] = f"{type(e).__name__}: {str(e)[:300]}"
+                _probe_state["status"] = "failed"
+            finally:
+                gc.collect()
+
+        asyncio.create_task(_job())
+        return JSONResponse(content={"status": "running", "note": "הבדיקה החלה"})
+
+
+@app.get("/probe/result", response_class=JSONResponse)
+async def probe_result():
+    """תוצאה מלאה בלבד, או null אם עדיין רצה."""
+    if _probe_state["status"] == "done":
+        return JSONResponse(content=_probe_state["result"])
+    return JSONResponse(content={
+        "status": _probe_state["status"],
+        "error": _probe_state["error"],
+        "memory": memory_report(),
+    })
 
 
 @app.get("/", response_class=HTMLResponse)
