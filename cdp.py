@@ -217,22 +217,32 @@ class Page:
         return await self._cdp.send(method, params, session_id=self.session_id)
 
     # ------------------------------------------------------------ navigation
-    async def goto(self, url: str, timeout: float = 25.0) -> dict:
-        url = check_url(url)
-        loaded = asyncio.Event()
-        self._cdp._on_load = lambda sid: loaded.set() if sid == self.session_id else None
+    async def goto(self, url: str, timeout: float = 12.0) -> dict:
+        """ניווט עם המתנה על readyState.
 
+        ⚠️ למה לא להמתין ל- Page.loadEventFired: האירוע לא מגיע אמינות
+        ב-chrome-headless-shell (נמדד: 30 שניות של timeout בכל דף, למרות
+        שהתוכן נטען במשמעות שנייה). polling על document.readyState הוא
+        אמין ומהיר יותר בהרבה.
+        """
+        url = check_url(url)
         res = await self._send("Page.navigate", {"url": url})
         if res.get("errorText"):
             raise BrowserError(f"navigate failed: {res['errorText']}")
-        try:
-            await asyncio.wait_for(loaded.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            # לא הקשיא - דפים רבים מעבירים הלאה; נמשיך ונבדוק את מה שיש
-            pass
-        self.url = url
+
+        deadline = asyncio.get_event_loop().time() + timeout
+        state = ""
+        while asyncio.get_event_loop().time() < deadline:
+            state = await self.evaluate("document.readyState") or ""
+            if state in ("interactive", "complete"):
+                break
+            await asyncio.sleep(0.2)
+
+        # נותן ל-DOM להתייצב מעט - תמיד חסר לזה כמה מאות מילישניות
+        await asyncio.sleep(0.3)
+        self.url = await self.current_url()
         self.title = await self.title_now()
-        return {"url": self.url, "title": self.title}
+        return {"url": self.url, "title": self.title, "ready_state": state}
 
     async def go_back(self, timeout: float = 20.0) -> dict:
         loaded = asyncio.Event()
