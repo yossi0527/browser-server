@@ -1,4 +1,10 @@
 fastapi>=0.109.0
 uvicorn>=0.25.0
 pydantic>=2.5.0
+# `websockets` הוא חבילת Python טהורה - אין לו תלויות מערכת,
+# ולכן מותקן עם pip בלבד (בלי apt). זה מה שמאפשר לדבר עם Chromium
+# ישירות ולחסוך את 108MB של מנהל ההתהליכים של Playwright.
+websockets>=12.0
+# Playwright משמש רק כדי להוריד את ההתקנה של Chromium (ואת ספריות
+# המערכת שלו) בזמן ה-build. בזמן ריצה אנחנו לא משתמשים בו כלל.
 playwright==1.63.0
