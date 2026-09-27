@@ -94,8 +94,16 @@ def require_rate_limit(request: Request) -> None:
 
 
 def guard_url(url: str) -> str:
-    """חסימת SSRF + אופציונלי רשימת דומיינים מורשים."""
-    clean = check_url(url)
+    """חסימת SSRF + אופציונלי רשימת דומיינים מורשים.
+
+    מעלה BrowserError כדי שהסוכן יקבל 400 מפורש ולא 500 - הוא צריך
+    להבחין בין "הכתובת חסומה" לבין "השרת נפל".
+    """
+    try:
+        clean = check_url(url)
+    except BrowserError as e:
+        raise HTTPException(status_code=400, detail=f"blocked url: {e}")
+
     if ALLOWED_DOMAINS:
         host = (urlparse(clean).hostname or "").lower()
         ok = any(host == d or host.endswith("." + d) for d in ALLOWED_DOMAINS)
