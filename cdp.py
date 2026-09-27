@@ -56,29 +56,72 @@ class BrowserError(RuntimeError):
     pass
 
 
-def find_browser() -> str:
-    """מאתר את ההתקנה של Chromium. מעדיף headless_shell - קל יותר."""
-    candidates: List[str] = []
-    for pat in (
-        "chromium_headless_shell-*/chrome-linux/headless_shell",
-        "chromium_headless_shell-*/chrome-linux64/headless_shell",
-        "chromium-*/chrome-linux/chrome",
-        "chromium-*/chrome-linux64/chrome",
-    ):
-        candidates += sorted(glob.glob(os.path.join(BROWSERS_PATH, pat)))
+# chrome המלא דורש --headless; headless_shell הוא כבר headless ונפגע מהדגל.
+# לכן מחזיקים יחד את הנתיב ואת הדגל הנדרש.
+_SHELL_GLOBS = (
+    "chromium_headless_shell-*/chrome-linux/headless_shell",
+    "chromium_headless_shell-*/chrome-linux64/headless_shell",
+    "chromium_headless_shell-*/headless_shell",
+    "chromium_headless_shell-*/*/headless_shell",
+)
+_FULL_GLOBS = (
+    "chromium-*/chrome-linux/chrome",
+    "chromium-*/chrome-linux64/chrome",
+    "chromium-*/chrome/chrome",
+)
 
-    for path in candidates:
+
+def _first_exec(paths: List[str]) -> Optional[str]:
+    for path in paths:
         if os.path.isfile(path) and os.access(path, os.X_OK):
             return path
-    # נפילה חזרה ל-PATH המערכת
+    return None
+
+
+def find_browser() -> str:
+    """מאתר Chromium. מעדיף headless_shell - קל יותר בזיכרון."""
+    return resolve_browser()[0]
+
+
+def resolve_browser() -> tuple:
+    """מחזיר (נתיב, צריך_headless_flag)."""
+    shell = _first_exec(sorted(glob.glob(os.path.join(BROWSERS_PATH, p))) for p in _SHELL_GLOBS)
+    if shell:
+        return shell, False
+    full = _first_exec(sorted(glob.glob(os.path.join(BROWSERS_PATH, p))) for p in _FULL_GLOBS)
+    if full:
+        return full, True
     for name in ("chromium", "chromium-browser", "google-chrome", "chrome"):
         found = shutil.which(name)
         if found:
-            return found
+            return found, True
     raise BrowserError(
         f"No Chromium binary found under {BROWSERS_PATH}. "
-        f"Globbed: {candidates}"
+        f"Shell globs: {list(_SHELL_GLOBS)} Full globs: {list(_FULL_GLOBS)}"
     )
+
+
+def browser_inventory() -> dict:
+    """אבחון: מה בדיוק מותקן, כדי לא לנחש."""
+    import glob as _glob
+    inv: Dict[str, Any] = {
+        "browsers_path": BROWSERS_PATH,
+        "exists": os.path.isdir(BROWSERS_PATH),
+        "dirs": sorted(os.path.basename(p) for p in _glob.glob(os.path.join(BROWSERS_PATH, "*"))),
+        "shell_candidates": [],
+        "full_candidates": [],
+    }
+    for p in _SHELL_GLOBS:
+        for hit in sorted(_glob.glob(os.path.join(BROWSERS_PATH, p))):
+            inv["shell_candidates"].append({"path": hit, "exec": os.access(hit, os.X_OK)})
+    for p in _FULL_GLOBS:
+        for hit in sorted(_glob.glob(os.path.join(BROWSERS_PATH, p))):
+            inv["full_candidates"].append({"path": hit, "exec": os.access(hit, os.X_OK)})
+    try:
+        inv["resolved"] = {"path": find_browser(), "needs_headless_flag": resolve_browser()[1]}
+    except BrowserError as e:
+        inv["resolved"] = {"error": str(e)}
+    return inv
 
 
 # ---------------------------------------------------------------- SSRF guard
@@ -390,9 +433,13 @@ class CDP:
     async def start(self) -> None:
         if self.proc is not None:
             return
-        binary = find_browser()
+        binary, needs_headless = resolve_browser()
+        args = list(LAUNCH_ARGS)
+        # chrome המלא לא ידע לעבוד ללא דגל headless; headless_shell - כן.
+        if needs_headless:
+            args.insert(0, "--headless=new")
         self._profile_dir = tempfile.mkdtemp(prefix="cdp-profile-")
-        cmd = [binary, *LAUNCH_ARGS, f"--user-data-dir={self._profile_dir}", "about:blank"]
+        cmd = [binary, *args, f"--user-data-dir={self._profile_dir}", "about:blank"]
         self.proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.DEVNULL,
@@ -400,8 +447,18 @@ class CDP:
         )
         self.browser_ws_url = await self._read_ws_url()
         if not self.browser_ws_url:
+            stderr = b""
+            if self.proc.stderr:
+                try:
+                    stderr = await asyncio.wait_for(self.proc.stderr.read(4000), timeout=2)
+                except Exception:
+                    stderr = b""
             await self.stop()
-            raise BrowserError("could not read DevTools websocket url from Chromium")
+            raise BrowserError(
+                "could not read DevTools websocket url. "
+                f"binary={binary} needs_headless_flag={needs_headless} "
+                f"stderr={stderr.decode('utf-8', 'replace')[-300:]!r}"
+            )
 
     async def _read_ws_url(self, timeout: float = 20.0) -> str:
         """Chromium מדפיס את כתובת ה-WebSocket על stderr."""
