@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: chromium-probe
+    runtime: python
+    region: frankfurt
+    branch: main
+    # --with-deps מתקין את ספריות המערכת ש-Chromium זקוק להן.
+    # זה הבנייה הכי כבדה בחינם (~3-4 דקות) אבל רק פעם אחת.
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt && playwright install --with-deps chromium
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    plan: free
+    healthCheckPath: /healthz
+    autoDeployTrigger: onCommit
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      # מונע את סוכן ה-playwright מלהוריד דפדפנים נוספים שלא לצורך
+      - key: PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD
+        value: "0"
