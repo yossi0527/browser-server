@@ -9,4 +9,4 @@ services:
     # ב-Docker אין buildCommand - הכל נעשה ב-Dockerfile
     plan: free
     healthCheckPath: /healthz
-    autoDeployTrigger: onCommit
+    autoDeployTrigger: commit
