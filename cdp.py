@@ -31,7 +31,16 @@ LAUNCH_ARGS = [
     # chromium-headless-shell, שכבר headless לפי הגדרה. מעבר --headless
     # איתו גורם לתהליך לצאת מיד עם שגיאה.
     "--no-sandbox",
-    "--disable-dev-shm-usage",
+
+    # ── חיסכון זיכרון: הכי חשובים ──────────────────────────────────
+    # כל תהליך renderer הוא 50-100MB. בלי אלה, Chromium מריץ 3-4
+    # תהליכים ואוכל 200-300MB שלא לצורך.
+    "--single-process",
+    "--renderer-process-limit=1",
+    "--in-process-gpu",
+    # ────────────────────────────────────────────────────────────────
+
+    "--disable-dev-shm-usage",       # /dev/shm זעיר בקונטיינרים
     "--disable-gpu",
     "--no-first-run",
     "--no-default-browser-check",
@@ -45,10 +54,23 @@ LAUNCH_ARGS = [
     "--disable-renderer-backgrounding",
     "--disable-ipc-flooding-protection",
     "--disable-features=TranslateUI,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints,CalculateNativeWinOcclusion",
+    # מגבילים את מטמוני הדפדפן כמעט לאפס
+    "--disk-cache-size=1",
+    "--media-cache-size=1",
+    "--disable-application-cache",
     "--blink-settings=imagesEnabled=false",
-    "--js-flags=--max-old-space-size=128",
+    "--js-flags=--max-old-space-size=96",
     "--window-size=1280,900",
     "--lang=he-IL",
+]
+
+# מסלולי משאבים שנחסמים ברמת הרשת. חיסום ברשת חזק יותר מ-blink-settings:
+# הבקשה לא יוצאת כלל, ולכן אין זיכרון זמני לפענוח.
+BLOCKED_URL_PATTERNS = [
+    "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.avif", "*.svg", "*.ico",
+    "*.mp4", "*.webm", "*.m4s", "*.mp3", "*.ogg", "*.wav", "*.m4a",
+    "*.woff", "*.woff2", "*.ttf", "*.otf", "*.eot",
+    "*.ttf2", "*doubleclick*", "*googletagmanager*", "*google-analytics*",
 ]
 
 
@@ -611,6 +633,11 @@ class CDP:
                 await page._send(domain, {})
             except Exception:
                 pass
+        # חסימת משאבים כבדים ברמת הרשת - חוסך זיכרון ורוחב
+        try:
+            await page._send("Network.setBlockedURLs", {"urls": BLOCKED_URL_PATTERNS})
+        except Exception:
+            pass
         return page
 
     async def stop(self) -> None:
