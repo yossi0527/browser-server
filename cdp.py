@@ -83,12 +83,24 @@ def find_browser() -> str:
     return resolve_browser()[0]
 
 
+def _collect(globs: tuple) -> List[str]:
+    """מרחיב תבניות glob לרשימת נתיבים אחת.
+
+    ⚠️ `sorted(glob.glob(x)) for p in GLOBS` מייצר רשימה-של-רשימות.
+    חייב להרחיב ידנית.
+    """
+    out: List[str] = []
+    for pattern in globs:
+        out.extend(sorted(glob.glob(os.path.join(BROWSERS_PATH, pattern))))
+    return out
+
+
 def resolve_browser() -> tuple:
     """מחזיר (נתיב, צריך_headless_flag)."""
-    shell = _first_exec(sorted(glob.glob(os.path.join(BROWSERS_PATH, p))) for p in _SHELL_GLOBS)
+    shell = _first_exec(_collect(_SHELL_GLOBS))
     if shell:
         return shell, False
-    full = _first_exec(sorted(glob.glob(os.path.join(BROWSERS_PATH, p))) for p in _FULL_GLOBS)
+    full = _first_exec(_collect(_FULL_GLOBS))
     if full:
         return full, True
     for name in ("chromium", "chromium-browser", "google-chrome", "chrome"):
@@ -112,10 +124,10 @@ def browser_inventory() -> dict:
         "full_candidates": [],
     }
     for p in _SHELL_GLOBS:
-        for hit in sorted(_glob.glob(os.path.join(BROWSERS_PATH, p))):
+        for hit in _collect((p,)):
             inv["shell_candidates"].append({"path": hit, "exec": os.access(hit, os.X_OK)})
     for p in _FULL_GLOBS:
-        for hit in sorted(_glob.glob(os.path.join(BROWSERS_PATH, p))):
+        for hit in _collect((p,)):
             inv["full_candidates"].append({"path": hit, "exec": os.access(hit, os.X_OK)})
     try:
         inv["resolved"] = {"path": find_browser(), "needs_headless_flag": resolve_browser()[1]}
